@@ -312,13 +312,16 @@ class FernandoLunaHandler(BaseHTTPRequestHandler):
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            return
 
     def read_json_body(self) -> dict[str, Any] | tuple[int, dict[str, Any]]:
         raw_length = self.headers.get("Content-Length")
