@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.content_config import content_config_payload
-from app.data import site_payload as legacy_site_payload
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 MAX_ADMIN_COLLECTION_SIZE = 250
+LINK_KINDS = {"github", "linkedin", "mail", "web"}
 
 
 class DatabaseDisabledError(RuntimeError):
@@ -21,28 +21,51 @@ class DatabaseDependencyError(RuntimeError):
     pass
 
 
+class RevisionConflictError(RuntimeError):
+    pass
+
+
 def database_url() -> str | None:
     return os.environ.get("FERLUNA_DATABASE_URL")
 
 
 def public_site_payload() -> dict[str, object]:
-    payload = legacy_site_payload()
-    payload.update(content_config_payload())
-
     if not database_url():
-        return payload
+        return filter_public_config(content_config_payload())
 
-    admin_payload = load_admin_site_payload()
-    payload.update(filter_public_config(admin_payload))
-    return payload
+    return filter_public_config(load_admin_site_payload())
 
 
 def load_admin_site_payload() -> dict[str, object]:
     if not database_url():
-        return content_config_payload()
+        payload = content_config_payload()
+        payload["revision"] = 0
+        return payload
 
     with connect() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name, role, tagline, location, email, avatar_alt, highlights
+                FROM site_profile
+                WHERE id = 'profile'
+                """
+            )
+            profile_row = cur.fetchone()
+            profile = profile_from_row(profile_row)
+
+            # Only override links from the table when a profile row exists.
+            # An initialized-but-unseeded database keeps the fallback links.
+            if profile_row is not None:
+                cur.execute(
+                    """
+                    SELECT id, label, href, kind
+                    FROM profile_links
+                    ORDER BY sort_order, id
+                    """
+                )
+                profile["links"] = [link_from_row(row) for row in cur.fetchall()]
+
             cur.execute(
                 """
                 SELECT id, route, label, eyebrow, title, description, icon_key, orbit,
@@ -73,30 +96,100 @@ def load_admin_site_payload() -> dict[str, object]:
             )
             tabs = [momentary_tab_from_row(row) for row in cur.fetchall()]
 
-    return {"sections": sections, "sectionItems": items, "momentaryTabs": tabs}
+            cur.execute(
+                """
+                SELECT id, tab_id, kind, kicker, title, meta, description, href,
+                       tags, icon_key, sort_order, visible_from, visible_until, featured
+                FROM momentary_items
+                ORDER BY tab_id, sort_order, id
+                """
+            )
+            tab_items = [momentary_item_from_row(row) for row in cur.fetchall()]
+
+            revision = read_revision(cur)
+
+    return {
+        "profile": profile,
+        "sections": sections,
+        "sectionItems": items,
+        "momentaryTabs": tabs,
+        "momentaryItems": tab_items,
+        "revision": revision,
+    }
 
 
-def replace_admin_site_payload(payload: dict[str, Any]) -> dict[str, object]:
+def replace_admin_site_payload(
+    payload: dict[str, Any],
+    expected_revision: int | None = None,
+) -> dict[str, object]:
     if not database_url():
         raise DatabaseDisabledError("FERLUNA_DATABASE_URL is not configured")
 
+    # Validate everything up front so an invalid payload never touches the
+    # database and the error is reported before any row is written.
+    profile_row, link_rows = build_profile_rows(payload.get("profile"))
     sections = validate_collection(payload.get("sections"), "sections")
     items = validate_collection(payload.get("sectionItems"), "sectionItems")
     tabs = validate_collection(payload.get("momentaryTabs"), "momentaryTabs")
-    section_ids = {require_text(section, "id") for section in sections}
+    tab_items = validate_collection(payload.get("momentaryItems"), "momentaryItems")
 
+    section_ids = {require_text(section, "id") for section in sections}
     for item in items:
         section_id = require_text(item, "sectionId")
         if section_id not in section_ids:
-            raise ValueError(f"Unknown sectionId for item {require_text(item, 'id')}: {section_id}")
+            raise ValueError(
+                f"Unknown sectionId for item {require_text(item, 'id')}: {section_id}"
+            )
+
+    tab_ids = {require_text(tab, "id") for tab in tabs}
+    for tab_item in tab_items:
+        tab_id = require_text(tab_item, "tabId")
+        if tab_id not in tab_ids:
+            raise ValueError(
+                f"Unknown tabId for item {require_text(tab_item, 'id')}: {tab_id}"
+            )
+
+    section_rows = [build_section_row(section) for section in sections]
+    item_rows = [build_item_row(item, "sectionId") for item in items]
+    tab_rows = [build_tab_row(tab) for tab in tabs]
+    tab_item_rows = [build_item_row(tab_item, "tabId") for tab_item in tab_items]
 
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM section_items")
-            cur.execute("DELETE FROM momentary_tabs")
-            cur.execute("DELETE FROM site_sections")
+            current_revision = read_revision(cur)
+            if expected_revision is not None and expected_revision != current_revision:
+                raise RevisionConflictError(
+                    "Content changed since it was loaded; reload before saving"
+                )
 
-            for section in sections:
+            cur.execute("DELETE FROM section_items")
+            cur.execute("DELETE FROM momentary_items")
+            cur.execute("DELETE FROM site_sections")
+            cur.execute("DELETE FROM momentary_tabs")
+            cur.execute("DELETE FROM profile_links")
+            cur.execute("DELETE FROM site_profile")
+
+            cur.execute(
+                """
+                INSERT INTO site_profile (
+                    id, name, role, tagline, location, email, avatar_alt,
+                    highlights, updated_at
+                )
+                VALUES ('profile', %s, %s, %s, %s, %s, %s, %s, now())
+                """,
+                profile_row,
+            )
+
+            for link_row in link_rows:
+                cur.execute(
+                    """
+                    INSERT INTO profile_links (id, label, href, kind, sort_order, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, now())
+                    """,
+                    link_row,
+                )
+
+            for section_row in section_rows:
                 cur.execute(
                     """
                     INSERT INTO site_sections (
@@ -105,24 +198,10 @@ def replace_admin_site_payload(payload: dict[str, Any]) -> dict[str, object]:
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                     """,
-                    (
-                        require_text(section, "id"),
-                        require_text(section, "route"),
-                        require_text(section, "label"),
-                        require_text(section, "eyebrow"),
-                        require_text(section, "title"),
-                        require_text(section, "description"),
-                        require_text(section, "iconKey"),
-                        require_orbit(section),
-                        require_number(section, "angle"),
-                        require_int(section, "order"),
-                        optional_datetime(section.get("visibleFrom")),
-                        optional_datetime(section.get("visibleUntil")),
-                        require_bool(section, "enabled"),
-                    ),
+                    section_row,
                 )
 
-            for item in items:
+            for item_row in item_rows:
                 cur.execute(
                     """
                     INSERT INTO section_items (
@@ -132,25 +211,10 @@ def replace_admin_site_payload(payload: dict[str, Any]) -> dict[str, object]:
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                     """,
-                    (
-                        require_text(item, "id"),
-                        require_text(item, "sectionId"),
-                        require_text(item, "kind"),
-                        require_text(item, "kicker"),
-                        require_text(item, "title"),
-                        optional_text(item.get("meta")),
-                        require_text(item, "description"),
-                        optional_text(item.get("href")),
-                        require_text_list(item.get("tags")),
-                        require_text(item, "iconKey"),
-                        require_int(item, "order"),
-                        optional_datetime(item.get("visibleFrom")),
-                        optional_datetime(item.get("visibleUntil")),
-                        require_bool(item, "featured"),
-                    ),
+                    item_row,
                 )
 
-            for tab in tabs:
+            for tab_row in tab_rows:
                 cur.execute(
                     """
                     INSERT INTO momentary_tabs (
@@ -159,17 +223,31 @@ def replace_admin_site_payload(payload: dict[str, Any]) -> dict[str, object]:
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
                     """,
-                    (
-                        require_text(tab, "id"),
-                        require_text(tab, "label"),
-                        require_text(tab, "iconKey"),
-                        require_number(tab, "angle"),
-                        require_int(tab, "order"),
-                        optional_datetime(tab.get("visibleFrom")),
-                        optional_datetime(tab.get("visibleUntil")),
-                        require_bool(tab, "enabled"),
-                    ),
+                    tab_row,
                 )
+
+            for tab_item_row in tab_item_rows:
+                cur.execute(
+                    """
+                    INSERT INTO momentary_items (
+                        id, tab_id, kind, kicker, title, meta, description, href,
+                        tags, icon_key, sort_order, visible_from, visible_until,
+                        featured, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    """,
+                    tab_item_row,
+                )
+
+            cur.execute(
+                """
+                INSERT INTO site_revision (id, revision, updated_at)
+                VALUES ('revision', %s, now())
+                ON CONFLICT (id) DO UPDATE
+                    SET revision = EXCLUDED.revision, updated_at = now()
+                """,
+                (current_revision + 1,),
+            )
 
         conn.commit()
 
@@ -200,17 +278,26 @@ def filter_public_config(payload: dict[str, object]) -> dict[str, object]:
     ]
     section_ids = {section["id"] for section in sections}
 
+    tabs = [
+        tab
+        for tab in payload["momentaryTabs"]
+        if is_enabled_and_visible(tab, now)
+    ]
+    tab_ids = {tab["id"] for tab in tabs}
+
     return {
+        "profile": payload["profile"],
         "sections": sorted(sections, key=lambda section: (section["order"], section["id"])),
         "sectionItems": [
             item
             for item in payload["sectionItems"]
             if item["sectionId"] in section_ids and is_visible(item, now)
         ],
-        "momentaryTabs": [
-            tab
-            for tab in payload["momentaryTabs"]
-            if is_enabled_and_visible(tab, now)
+        "momentaryTabs": sorted(tabs, key=lambda tab: (tab["order"], tab["id"])),
+        "momentaryItems": [
+            item
+            for item in payload["momentaryItems"]
+            if item["tabId"] in tab_ids and is_visible(item, now)
         ],
     }
 
@@ -233,6 +320,33 @@ def connect() -> Iterator[Any]:
         conn.close()
 
 
+def read_revision(cur: Any) -> int:
+    cur.execute("SELECT revision FROM site_revision WHERE id = 'revision'")
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def profile_from_row(row: tuple[Any, ...] | None) -> dict[str, object]:
+    if row is None:
+        profile = content_config_payload()["profile"]
+        return dict(profile)  # type: ignore[arg-type]
+
+    return {
+        "name": row[0],
+        "role": row[1],
+        "tagline": row[2],
+        "location": row[3],
+        "email": row[4],
+        "avatarAlt": row[5],
+        "highlights": list(row[6] or []),
+        "links": [],
+    }
+
+
+def link_from_row(row: tuple[Any, ...]) -> dict[str, object]:
+    return {"label": row[1], "href": row[2], "kind": row[3]}
+
+
 def section_from_row(row: tuple[Any, ...]) -> dict[str, object]:
     return {
         "id": row[0],
@@ -251,10 +365,8 @@ def section_from_row(row: tuple[Any, ...]) -> dict[str, object]:
     }
 
 
-def item_from_row(row: tuple[Any, ...]) -> dict[str, object]:
+def _item_common(row: tuple[Any, ...]) -> dict[str, object]:
     return {
-        "id": row[0],
-        "sectionId": row[1],
         "kind": row[2],
         "kicker": row[3],
         "title": row[4],
@@ -270,6 +382,14 @@ def item_from_row(row: tuple[Any, ...]) -> dict[str, object]:
     }
 
 
+def item_from_row(row: tuple[Any, ...]) -> dict[str, object]:
+    return {"id": row[0], "sectionId": row[1], **_item_common(row)}
+
+
+def momentary_item_from_row(row: tuple[Any, ...]) -> dict[str, object]:
+    return {"id": row[0], "tabId": row[1], **_item_common(row)}
+
+
 def momentary_tab_from_row(row: tuple[Any, ...]) -> dict[str, object]:
     return {
         "id": row[0],
@@ -281,6 +401,95 @@ def momentary_tab_from_row(row: tuple[Any, ...]) -> dict[str, object]:
         "visibleUntil": serialize_datetime(row[6]),
         "enabled": row[7],
     }
+
+
+def build_profile_rows(value: Any) -> tuple[tuple[Any, ...], list[tuple[Any, ...]]]:
+    if not isinstance(value, dict):
+        raise ValueError("profile must be an object")
+
+    profile_row = (
+        require_text(value, "name"),
+        require_text(value, "role"),
+        require_text(value, "tagline"),
+        require_text(value, "location"),
+        require_text(value, "email"),
+        require_text(value, "avatarAlt"),
+        require_text_list(value.get("highlights")),
+    )
+
+    raw_links = value.get("links")
+    if raw_links is None:
+        raw_links = []
+    if not isinstance(raw_links, list):
+        raise ValueError("links must be a list")
+    if len(raw_links) > MAX_ADMIN_COLLECTION_SIZE:
+        raise ValueError(f"links exceeds {MAX_ADMIN_COLLECTION_SIZE} entries")
+
+    link_rows: list[tuple[Any, ...]] = []
+    for index, raw_link in enumerate(raw_links, start=1):
+        if not isinstance(raw_link, dict):
+            raise ValueError("link entries must be objects")
+        link_rows.append(
+            (
+                f"link-{index}",
+                require_text(raw_link, "label"),
+                require_text(raw_link, "href"),
+                require_link_kind(raw_link),
+                index * 10,
+            )
+        )
+
+    return profile_row, link_rows
+
+
+def build_section_row(section: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        require_text(section, "id"),
+        require_text(section, "route"),
+        require_text(section, "label"),
+        require_text(section, "eyebrow"),
+        require_text(section, "title"),
+        require_text(section, "description"),
+        require_text(section, "iconKey"),
+        require_orbit(section),
+        require_number(section, "angle"),
+        require_int(section, "order"),
+        optional_datetime(section.get("visibleFrom")),
+        optional_datetime(section.get("visibleUntil")),
+        require_bool(section, "enabled"),
+    )
+
+
+def build_item_row(item: dict[str, Any], owner_key: str) -> tuple[Any, ...]:
+    return (
+        require_text(item, "id"),
+        require_text(item, owner_key),
+        require_text(item, "kind"),
+        require_text(item, "kicker"),
+        require_text(item, "title"),
+        optional_text(item.get("meta")),
+        require_text(item, "description"),
+        optional_text(item.get("href")),
+        require_text_list(item.get("tags")),
+        require_text(item, "iconKey"),
+        require_int(item, "order"),
+        optional_datetime(item.get("visibleFrom")),
+        optional_datetime(item.get("visibleUntil")),
+        require_bool(item, "featured"),
+    )
+
+
+def build_tab_row(tab: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        require_text(tab, "id"),
+        require_text(tab, "label"),
+        require_text(tab, "iconKey"),
+        require_number(tab, "angle"),
+        require_int(tab, "order"),
+        optional_datetime(tab.get("visibleFrom")),
+        optional_datetime(tab.get("visibleUntil")),
+        require_bool(tab, "enabled"),
+    )
 
 
 def validate_collection(value: Any, name: str) -> list[dict[str, Any]]:
@@ -342,6 +551,13 @@ def require_orbit(payload: dict[str, Any]) -> str:
     if orbit not in {"inner", "outer"}:
         raise ValueError("orbit must be inner or outer")
     return orbit
+
+
+def require_link_kind(payload: dict[str, Any]) -> str:
+    kind = require_text(payload, "kind")
+    if kind not in LINK_KINDS:
+        raise ValueError("link kind must be github, linkedin, mail or web")
+    return kind
 
 
 def optional_datetime(value: Any) -> datetime | None:

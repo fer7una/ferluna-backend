@@ -118,13 +118,3 @@ DOCS = [
         "href": "https://docs.fernandoluna.dev/recursos",
     },
 ]
-
-
-def site_payload() -> dict[str, object]:
-    return {
-        "profile": PROFILE,
-        "cv": CV,
-        "projects": PROJECTS,
-        "posts": POSTS,
-        "docs": DOCS,
-    }

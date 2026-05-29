@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
+from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -19,16 +22,59 @@ from app.auth import (
 from app.content_store import (
     DatabaseDependencyError,
     DatabaseDisabledError,
+    RevisionConflictError,
     initialize_database,
     load_admin_site_payload,
     public_site_payload,
     replace_admin_site_payload,
     seed_database,
 )
-from app.data import CV, DOCS, POSTS, PROFILE, PROJECTS
 
 DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 MAX_JSON_BODY_BYTES = 256 * 1024
+
+
+def login_rate_limit() -> int:
+    try:
+        return int(os.environ.get("FERLUNA_LOGIN_RATE_LIMIT", "10"))
+    except ValueError:
+        return 10
+
+
+def login_rate_window_seconds() -> int:
+    try:
+        return int(os.environ.get("FERLUNA_LOGIN_RATE_WINDOW", "300"))
+    except ValueError:
+        return 300
+
+
+_login_attempts_lock = threading.Lock()
+_login_attempts: dict[str, deque[float]] = defaultdict(deque)
+
+
+def login_rate_limited(client_id: str) -> bool:
+    """Record a login attempt and report whether the client is over the limit."""
+    limit = login_rate_limit()
+    if limit <= 0:
+        return False
+
+    window = login_rate_window_seconds()
+    now = time.monotonic()
+    with _login_attempts_lock:
+        attempts = _login_attempts[client_id]
+        while attempts and now - attempts[0] > window:
+            attempts.popleft()
+        if len(attempts) >= limit:
+            return True
+        attempts.append(now)
+        return False
+
+
+def reset_login_attempts(client_id: str | None) -> None:
+    if client_id is None:
+        return
+    with _login_attempts_lock:
+        _login_attempts.pop(client_id, None)
 
 
 def allowed_origins() -> list[str]:
@@ -48,17 +94,8 @@ def cors_origin(request_origin: str | None) -> str:
 def resolve_route(path: str) -> tuple[int, dict[str, Any]]:
     route = urlparse(path).path.rstrip("/") or "/"
 
-    routes: dict[str, dict[str, Any]] = {
-        "/api/health": {"status": "ok", "service": "ferluna-backend"},
-        "/api/profile": PROFILE,
-        "/api/cv": CV,
-        "/api/projects": {"projects": PROJECTS},
-        "/api/posts": {"posts": POSTS},
-        "/api/docs": {"docs": DOCS},
-    }
-
-    if route in routes:
-        return HTTPStatus.OK, routes[route]
+    if route == "/api/health":
+        return HTTPStatus.OK, {"status": "ok", "service": "ferluna-backend"}
 
     if route == "/api/site":
         return with_runtime_errors(public_site_payload)
@@ -74,6 +111,7 @@ def resolve_admin_route(
     method: str,
     headers: Any,
     body: dict[str, Any] | None = None,
+    client_id: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     route = urlparse(path).path.rstrip("/") or "/"
     if route == "/api/admin/login":
@@ -87,7 +125,7 @@ def resolve_admin_route(
                 "error": "invalid_json",
                 "message": "JSON body is required",
             }
-        return resolve_admin_login(body)
+        return resolve_admin_login(body, client_id)
 
     if route != "/api/admin/site":
         return HTTPStatus.NOT_FOUND, {
@@ -108,7 +146,19 @@ def resolve_admin_route(
                 "error": "invalid_json",
                 "message": "JSON body is required",
             }
-        return with_value_errors(lambda: replace_admin_site_payload(body))
+
+        expected_revision = body.get("expectedRevision")
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+        ):
+            return HTTPStatus.BAD_REQUEST, {
+                "error": "invalid_payload",
+                "message": "expectedRevision must be an integer",
+            }
+
+        return with_value_errors(
+            lambda: replace_admin_site_payload(body, expected_revision)
+        )
 
     return HTTPStatus.METHOD_NOT_ALLOWED, {
         "error": "method_not_allowed",
@@ -116,7 +166,10 @@ def resolve_admin_route(
     }
 
 
-def resolve_admin_login(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+def resolve_admin_login(
+    body: dict[str, Any],
+    client_id: str | None = None,
+) -> tuple[int, dict[str, Any]]:
     password = body.get("password")
     if not isinstance(password, str) or not password:
         return HTTPStatus.BAD_REQUEST, {
@@ -130,11 +183,17 @@ def resolve_admin_login(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
                 "error": "admin_disabled",
                 "message": "FERLUNA_ADMIN_PASSWORD and FERLUNA_JWT_SECRET must be configured",
             }
+        if client_id is not None and login_rate_limited(client_id):
+            return HTTPStatus.TOO_MANY_REQUESTS, {
+                "error": "too_many_requests",
+                "message": "Too many login attempts; try again later",
+            }
         if not verify_admin_password(password):
             return HTTPStatus.UNAUTHORIZED, {
                 "error": "unauthorized",
                 "message": "Invalid admin credentials",
             }
+        reset_login_attempts(client_id)
         return HTTPStatus.OK, create_admin_jwt()
     except AuthConfigError as error:
         return HTTPStatus.SERVICE_UNAVAILABLE, {
@@ -188,6 +247,11 @@ def with_value_errors(factory: Any) -> tuple[int, dict[str, Any]]:
             "error": "invalid_payload",
             "message": str(error),
         }
+    except RevisionConflictError as error:
+        return HTTPStatus.CONFLICT, {
+            "error": "revision_conflict",
+            "message": str(error),
+        }
     except DatabaseDisabledError as error:
         return HTTPStatus.SERVICE_UNAVAILABLE, {
             "error": "database_disabled",
@@ -213,9 +277,17 @@ class FernandoLunaHandler(BaseHTTPRequestHandler):
         self.send_cors_headers()
         self.end_headers()
 
+    def client_id(self) -> str | None:
+        address = getattr(self, "client_address", None)
+        if isinstance(address, tuple) and address:
+            return str(address[0])
+        return None
+
     def do_GET(self) -> None:
         if urlparse(self.path).path.rstrip("/") in {"/api/admin/site", "/api/admin/login"}:
-            status, payload = resolve_admin_route(self.path, "GET", self.headers)
+            status, payload = resolve_admin_route(
+                self.path, "GET", self.headers, client_id=self.client_id()
+            )
         else:
             status, payload = resolve_route(self.path)
 
@@ -232,7 +304,9 @@ class FernandoLunaHandler(BaseHTTPRequestHandler):
         if isinstance(body, tuple):
             status, payload = body
         else:
-            status, payload = resolve_admin_route(self.path, method, self.headers, body)
+            status, payload = resolve_admin_route(
+                self.path, method, self.headers, body, client_id=self.client_id()
+            )
 
         self.send_json(status, payload)
 

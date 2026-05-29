@@ -2,7 +2,9 @@
 
 API Python para alimentar el portal personal.
 
-El contenido editable puede vivir en PostgreSQL. Sin `FERLUNA_DATABASE_URL`, la API usa el contenido local de fallback.
+Todo el contenido del portal (perfil, secciones, items, pestañas e items de pestaña)
+vive en PostgreSQL y se edita desde el panel de administración. Sin `FERLUNA_DATABASE_URL`,
+la API sirve el contenido de seed local como fallback de desarrollo.
 
 ## Instalar dependencias opcionales
 
@@ -26,11 +28,16 @@ FERLUNA_DATABASE_URL=postgresql://usuario:password@localhost:5432/ferluna
 FERLUNA_ADMIN_PASSWORD=change-me
 FERLUNA_JWT_SECRET=use-a-long-random-secret
 FERLUNA_JWT_TTL_SECONDS=1800
+FERLUNA_LOGIN_RATE_LIMIT=10
+FERLUNA_LOGIN_RATE_WINDOW=300
 ```
+
+`FERLUNA_LOGIN_RATE_LIMIT` limita los intentos de login por IP dentro de
+`FERLUNA_LOGIN_RATE_WINDOW` segundos (usa `0` para desactivar el límite).
 
 ## PostgreSQL
 
-Crear tablas:
+Crear tablas (idempotente):
 
 ```powershell
 python -m app.main init-db
@@ -42,20 +49,23 @@ Cargar el contenido inicial editable:
 python -m app.main seed-db
 ```
 
+`seed-db` es destructivo: reemplaza todo el contenido por el seed. Ejecútalo solo
+en una base vacía o cuando quieras restablecer el contenido por defecto.
+
 ## Endpoints
 
 - `GET /api/health`
-- `GET /api/profile`
-- `GET /api/cv`
-- `GET /api/projects`
-- `GET /api/posts`
-- `GET /api/docs`
-- `GET /api/site`
+- `GET /api/site` — payload público (`profile`, `sections`, `sectionItems`, `momentaryTabs`, `momentaryItems`)
 - `POST /api/admin/login`
 - `GET /api/admin/site`
 - `PUT /api/admin/site`
 
-`POST /api/admin/login` recibe `{ "password": "..." }` y devuelve un JWT con expiracion. Las rutas `/api/admin/site` requieren `Authorization: Bearer <jwt>`.
+`POST /api/admin/login` recibe `{ "password": "..." }` y devuelve un JWT con expiración.
+Las rutas `/api/admin/site` requieren `Authorization: Bearer <jwt>`.
+
+`GET /api/admin/site` devuelve el documento editable completo más `revision`.
+`PUT /api/admin/site` reemplaza todo el contenido; envía `expectedRevision` (la última
+`revision` cargada) para detectar ediciones concurrentes: si no coincide responde `409`.
 
 ## Tests
 

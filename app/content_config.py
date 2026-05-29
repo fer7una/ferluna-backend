@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from app.data import CV, DOCS, POSTS, PROJECTS
+import copy
+
+from app.data import CV, DOCS, POSTS, PROFILE, PROJECTS
 
 SECTIONS = [
     {
@@ -252,9 +254,63 @@ def section_items() -> list[dict[str, object]]:
     return items
 
 
+MOMENTARY_ITEM_SEEDS = {
+    "references": [
+        ("Lecturas de referencia", "Artículos y libros que vuelvo a consultar.", "book"),
+        ("Documentación base", "Especificaciones y guías oficiales que uso a menudo.", "newspaper"),
+    ],
+    "opportunities": [
+        ("Disponible para proyectos", "Abierto a colaboraciones y encargos puntuales.", "rocket"),
+        ("Áreas de interés", "Producto web, automatización y documentación técnica.", "layers"),
+    ],
+    "events": [
+        ("Próximas fechas", "Charlas, quedadas y publicaciones en preparación.", "newspaper"),
+        ("Histórico", "Registro breve de hitos y participaciones.", "book"),
+    ],
+    "ideas": [
+        ("Notas en bruto", "Ideas sin pulir que quiero explorar más adelante.", "layers"),
+        ("Experimentos", "Pruebas técnicas y bocetos de producto.", "rocket"),
+    ],
+}
+
+
+def momentary_items() -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for tab in MOMENTARY_TABS:
+        tab_id = tab["id"]
+        for index, (title, description, icon_key) in enumerate(
+            MOMENTARY_ITEM_SEEDS.get(tab_id, []), start=1
+        ):
+            items.append(
+                {
+                    "id": f"{tab_id}-item-{index}",
+                    "tabId": tab_id,
+                    "kind": "note",
+                    "kicker": tab["label"],
+                    "title": title,
+                    "meta": None,
+                    "description": description,
+                    "href": None,
+                    "tags": [],
+                    "iconKey": icon_key,
+                    "order": index * 10,
+                    "visibleFrom": None,
+                    "visibleUntil": None,
+                    "featured": False,
+                }
+            )
+    return items
+
+
+def profile_payload() -> dict[str, object]:
+    return copy.deepcopy(PROFILE)
+
+
 def content_config_payload() -> dict[str, object]:
     return {
-        "sections": SECTIONS,
+        "profile": profile_payload(),
+        "sections": copy.deepcopy(SECTIONS),
         "sectionItems": section_items(),
-        "momentaryTabs": MOMENTARY_TABS,
+        "momentaryTabs": copy.deepcopy(MOMENTARY_TABS),
+        "momentaryItems": momentary_items(),
     }
