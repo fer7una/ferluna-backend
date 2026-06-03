@@ -1,13 +1,18 @@
+import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from app.auth import create_admin_jwt
 from app.content_store import (
     RevisionConflictError,
     build_profile_rows,
+    build_visual_settings_row,
     require_link_kind,
     validate_collection,
 )
+from app.env_loader import load_env_file
 from app.main import (
     reset_login_attempts,
     resolve_admin_login,
@@ -30,6 +35,7 @@ class ApiRouteTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertIn("profile", payload)
+        self.assertIn("visualSettings", payload)
         self.assertIn("sections", payload)
         self.assertIn("sectionItems", payload)
         self.assertIn("momentaryTabs", payload)
@@ -37,6 +43,14 @@ class ApiRouteTests(unittest.TestCase):
         # The legacy top-level blocks no longer exist; everything is sections/items.
         for legacy_key in ("cv", "projects", "posts", "docs"):
             self.assertNotIn(legacy_key, payload)
+
+    def test_site_sections_do_not_expose_legacy_orbit_slot(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            status, payload = resolve_route("/api/site")
+
+        self.assertEqual(status, 200)
+        for section in payload["sections"]:
+            self.assertNotIn("orbit", section)
 
     def test_admin_route_requires_token(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -136,6 +150,33 @@ class AdminLoginRateLimitTests(unittest.TestCase):
         self.assertEqual(again, 401)
 
 
+class EnvLoaderTests(unittest.TestCase):
+    def test_load_env_file_sets_missing_values_without_overriding_existing_env(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "FERLUNA_DATABASE_URL=postgresql://file:file@localhost:5432/ferluna",
+                        "FERLUNA_API_HOST=0.0.0.0",
+                        "FERLUNA_ADMIN_PASSWORD='quoted-secret'",
+                        "# ignored comment",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"FERLUNA_API_HOST": "127.0.0.1"}, clear=True):
+                load_env_file(env_path)
+
+                self.assertEqual(
+                    "postgresql://file:file@localhost:5432/ferluna",
+                    os.environ["FERLUNA_DATABASE_URL"],
+                )
+                self.assertEqual("127.0.0.1", os.environ["FERLUNA_API_HOST"])
+                self.assertEqual("quoted-secret", os.environ["FERLUNA_ADMIN_PASSWORD"])
+
+
 class ContentValidationTests(unittest.TestCase):
     def test_revision_conflict_maps_to_409(self) -> None:
         def boom() -> dict[str, object]:
@@ -185,6 +226,24 @@ class ContentValidationTests(unittest.TestCase):
     def test_validate_collection_rejects_non_list(self) -> None:
         with self.assertRaises(ValueError):
             validate_collection({"not": "a list"}, "sections")
+
+    def test_build_visual_settings_row_requires_positive_durations(self) -> None:
+        self.assertEqual(
+            build_visual_settings_row(
+                {
+                    "sectionOrbitDurationSeconds": 12,
+                    "momentaryOrbitDurationSeconds": 6.5,
+                }
+            ),
+            (12.0, 6.5),
+        )
+        with self.assertRaises(ValueError):
+            build_visual_settings_row(
+                {
+                    "sectionOrbitDurationSeconds": 0,
+                    "momentaryOrbitDurationSeconds": 6.5,
+                }
+            )
 
 
 if __name__ == "__main__":

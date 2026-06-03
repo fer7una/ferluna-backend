@@ -27,7 +27,6 @@ CREATE TABLE IF NOT EXISTS site_sections (
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     icon_key TEXT NOT NULL,
-    orbit TEXT NOT NULL CHECK (orbit IN ('inner', 'outer')),
     angle DOUBLE PRECISION NOT NULL,
     sort_order INTEGER NOT NULL DEFAULT 0,
     visible_from TIMESTAMPTZ,
@@ -35,6 +34,8 @@ CREATE TABLE IF NOT EXISTS site_sections (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE site_sections DROP COLUMN IF EXISTS orbit;
 
 CREATE TABLE IF NOT EXISTS section_items (
     id TEXT PRIMARY KEY,
@@ -81,6 +82,15 @@ CREATE TABLE IF NOT EXISTS momentary_items (
     visible_from TIMESTAMPTZ,
     visible_until TIMESTAMPTZ,
     featured BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS site_visual_settings (
+    id TEXT PRIMARY KEY DEFAULT 'visual' CHECK (id = 'visual'),
+    section_orbit_duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 34
+        CHECK (section_orbit_duration_seconds > 0),
+    momentary_orbit_duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 18
+        CHECK (momentary_orbit_duration_seconds > 0),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

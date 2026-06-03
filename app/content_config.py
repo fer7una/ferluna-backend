@@ -4,6 +4,11 @@ import copy
 
 from app.data import CV, DOCS, POSTS, PROFILE, PROJECTS
 
+VISUAL_SETTINGS = {
+    "sectionOrbitDurationSeconds": 34,
+    "momentaryOrbitDurationSeconds": 18,
+}
+
 SECTIONS = [
     {
         "id": "cv",
@@ -13,7 +18,6 @@ SECTIONS = [
         "title": "CV vivo",
         "description": "Experiencia, capacidades y foco profesional.",
         "iconKey": "briefcase",
-        "orbit": "inner",
         "angle": -90,
         "order": 10,
         "visibleFrom": None,
@@ -28,7 +32,6 @@ SECTIONS = [
         "title": "Proyectos visibles",
         "description": "Productos, laboratorios y webs que puedo enseñar.",
         "iconKey": "code",
-        "orbit": "inner",
         "angle": 0,
         "order": 20,
         "visibleFrom": None,
@@ -43,7 +46,6 @@ SECTIONS = [
         "title": "Notas personales",
         "description": "Espacio para publicar ideas, avances y aprendizajes.",
         "iconKey": "user",
-        "orbit": "inner",
         "angle": 90,
         "order": 30,
         "visibleFrom": None,
@@ -58,7 +60,6 @@ SECTIONS = [
         "title": "Documentación",
         "description": "Accesos a guías, recursos y webs técnicas.",
         "iconKey": "book",
-        "orbit": "inner",
         "angle": 180,
         "order": 40,
         "visibleFrom": None,
@@ -309,6 +310,7 @@ def profile_payload() -> dict[str, object]:
 def content_config_payload() -> dict[str, object]:
     return {
         "profile": profile_payload(),
+        "visualSettings": copy.deepcopy(VISUAL_SETTINGS),
         "sections": copy.deepcopy(SECTIONS),
         "sectionItems": section_items(),
         "momentaryTabs": copy.deepcopy(MOMENTARY_TABS),
